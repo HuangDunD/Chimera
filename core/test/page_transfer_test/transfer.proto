@@ -1,0 +1,16 @@
+syntax="proto3";
+option cc_generic_services = true;
+
+package page_transfer_service;
+
+message GetPageRequest {
+    sint32 page_cnt = 1;
+}
+
+message GetPageResponse {
+    repeated bytes page_data = 1;
+}
+
+service PageTransferService {
+    rpc GetPage(GetPageRequest) returns (GetPageResponse);
+};
