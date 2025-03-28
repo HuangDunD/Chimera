@@ -391,7 +391,11 @@ Page* ComputeServer::rpc_phase_switch_fetch_s_page_new(table_id_t table_id, page
     // 计数
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->pages_ + page_id;
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#endif
         node_id_t valid_node = node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
         if(valid_node != -1){
             // 从远程更新数据页
@@ -493,7 +497,11 @@ Page* ComputeServer::rpc_phase_switch_coro_fetch_s_page_new(CoroutineScheduler* 
     // 计数
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->pages_ + page_id;
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#endif
         node_id_t valid_node = node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
         if(valid_node != -1){
             // 从远程更新数据页
@@ -632,7 +640,11 @@ Page* ComputeServer::rpc_phase_switch_fetch_x_page_new(table_id_t table_id, page
     // 计数
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->pages_ + page_id;
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#endif
         node_id_t valid_node = node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
         if(valid_node != -1){
             // 从远程更新数据页
@@ -736,7 +748,11 @@ Page* ComputeServer::rpc_phase_switch_coro_fetch_x_page_new(CoroutineScheduler* 
     // 计数
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->pages_ + page_id;
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#endif
         node_id_t valid_node = node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
         if(valid_node != -1){
             // 从远程更新数据页
@@ -827,8 +843,11 @@ void ComputeServer::rpc_phase_switch_release_s_page_new(table_id_t table_id, pag
     //     }
     //     assert(node_->phase == Phase::SWITCH_TO_PAR || node_->phase == Phase::GLOBAL); // 非本地逻辑分区只在Global Phase访问
     // }
-
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL || table_id == 7){
+#endif
         node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockShared();
     }
     else{
@@ -923,8 +942,11 @@ void ComputeServer::rpc_phase_switch_release_x_page_new(table_id_t table_id, pag
     //     }
     //     assert(node_->phase == Phase::SWITCH_TO_PAR || node_->phase == Phase::GLOBAL); // 非本地逻辑分区只在Global Phase访问
     // }
-
+#if UniformHot
+    if(node_->phase == Phase::PARTITION || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#else
     if((node_->phase == Phase::PARTITION && is_partitioned_page_new(table_id, page_id)) || node_->phase == Phase::SWITCH_TO_GLOBAL){
+#endif
         node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
     }
     else{
@@ -1058,8 +1080,10 @@ void ComputeServer::switch_phase(){
         LOG(INFO) << "Epoch: " << node_->epoch << " par_time: " << node_->partition_ms << " global_time: " << node_->global_ms; 
         
         // 1.1.5 获取分区所有数据的invalid pages
-        if(ComputeNodeCount != 1){
+        if(ComputeNodeCount != 1 && SYSTEM_MODE != 12){
             rpc_phase_switch_get_invalid_pages_new();
+        } else if(ComputeNodeCount != 1 && SYSTEM_MODE == 12){
+            rpc_phase_switch_sync_invalid_pages_new(); // 由于star采用非对称的方式，因此这里同步所有页面以防止partitioned phase节点之间吞吐量显著差异
         }
 
         auto partition_phase_start = std::chrono::high_resolution_clock::now();
@@ -1144,7 +1168,7 @@ void ComputeServer::switch_phase(){
         }
 
         // !特例：如果只有一个计算节点，则不需要进行Global Phase
-        if(ComputeNodeCount == 1 || CrossNodeAccessRatio == 0) continue;
+        // if(ComputeNodeCount == 1 || CrossNodeAccessRatio == 0) continue;
 
         // 2. 切换为Global Phase
         // 2.1 远程对全局数据加S锁

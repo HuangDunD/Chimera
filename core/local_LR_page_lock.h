@@ -304,6 +304,18 @@ public:
         }
         return unlock_remote;
     }
+
+    void VarifyRemoteLock(bool status){
+        mutex.lock();
+        if(status == true){
+            // x lock remote
+            assert(remote_mode == LockMode::EXCLUSIVE);
+        } else{
+            // s lock remote
+            assert(remote_mode == LockMode::SHARED || remote_mode == LockMode::EXCLUSIVE);
+        }
+        mutex.unlock();
+    }
 };
 
 // Lazy Release的锁表

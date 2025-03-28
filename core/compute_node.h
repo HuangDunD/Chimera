@@ -60,7 +60,7 @@ public:
         }
         if (SYSTEM_MODE == 0)
             eager_local_page_lock_table = nullptr;
-        else if (SYSTEM_MODE == 1)
+        else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 11)
             lazy_local_page_lock_table = nullptr;
         else if (SYSTEM_MODE == 2) {
             local_page_lock_table = nullptr;
@@ -91,11 +91,9 @@ public:
                 threads_switch[i] = false;
                 threads_finish[i] = false;
             }
-        }
-        else if (SYSTEM_MODE == 6) {
+        } else if (SYSTEM_MODE == 6) {
             delay_fetch_local_page_lock_table = nullptr;
-        }
-        else if (SYSTEM_MODE == 7) {
+        } else if (SYSTEM_MODE == 7) {
             local_page_lock_table = nullptr;
             delay_fetch_local_page_lock_table = nullptr;
             threads_switch = new bool[thread_num_per_node];
@@ -104,9 +102,17 @@ public:
                 threads_switch[i] = false;
                 threads_finish[i] = false;
             }
-        }
-        else if (SYSTEM_MODE == 8 || SYSTEM_MODE == 9) {
+        } else if (SYSTEM_MODE == 8 || SYSTEM_MODE == 9 || SYSTEM_MODE == 10) {
             local_page_lock_table = nullptr;
+        } else if (SYSTEM_MODE == 12) {
+            local_page_lock_table = nullptr;
+            lazy_local_page_lock_table = nullptr;
+            threads_switch = new bool[thread_num_per_node];
+            threads_finish = new bool[thread_num_per_node];
+            for (int i = 0; i < thread_num_per_node; i++) {
+                threads_switch[i] = false;
+                threads_finish[i] = false;
+            }
         }
         else {
             LOG(ERROR) << "SYSTEM_MODE ERROR!";
@@ -160,7 +166,26 @@ public:
                 for(int i = 0; i < 2; i++){
                     local_page_lock_tables.emplace_back(new LocalPageLockTable());
                 }
-            } 
+            } else if(SYSTEM_MODE == 10){
+                local_page_lock_tables.reserve(2);
+                for(int i = 0; i < 2; i++){
+                    local_page_lock_tables.emplace_back(new LocalPageLockTable());
+                }
+            } else if(SYSTEM_MODE == 11){
+                lazy_local_page_lock_tables.reserve(2);
+                local_page_lock_tables.reserve(2);
+                for(int i = 0; i < 2; i++){
+                    lazy_local_page_lock_tables.emplace_back(new LRLocalPageLockTable());
+                    local_page_lock_tables.emplace_back(nullptr);
+                }
+            } else if (SYSTEM_MODE == 12) {
+                local_page_lock_tables.reserve(2);
+                lazy_local_page_lock_tables.reserve(2);
+                for(int i = 0; i < 2; i++){
+                    local_page_lock_tables.emplace_back(new LocalPageLockTable());
+                    lazy_local_page_lock_tables.emplace_back(new LRLocalPageLockTable());
+                }
+            }
             else assert(false);
 
             std::vector<int> max_page_per_table;
@@ -306,6 +331,28 @@ public:
                     local_page_lock_tables.emplace_back(new LocalPageLockTable());
                 }
             }
+            else if(SYSTEM_MODE == 10){
+                local_page_lock_tables.reserve(11);
+                for(int i = 0; i < 11; i++){
+                    local_page_lock_tables.emplace_back(new LocalPageLockTable());
+                }
+            } 
+            else if(SYSTEM_MODE == 11){
+                lazy_local_page_lock_tables.reserve(11);
+                local_page_lock_tables.reserve(11);
+                for(int i = 0; i < 11; i++){
+                    lazy_local_page_lock_tables.emplace_back(new LRLocalPageLockTable());
+                    local_page_lock_tables.emplace_back(nullptr);
+                }
+            }
+            else if(SYSTEM_MODE == 12){
+                local_page_lock_tables.reserve(11);
+                lazy_local_page_lock_tables.reserve(11);
+                for(int i = 0; i < 11; i++){
+                    local_page_lock_tables.emplace_back(new LocalPageLockTable());
+                    lazy_local_page_lock_tables.emplace_back(new LRLocalPageLockTable());
+                }
+            }
             else assert(false);
 
             std::vector<int> max_page_per_table;
@@ -443,6 +490,10 @@ public:
         assert(delay_fetch_local_page_lock_tables[table_id] != nullptr && local_page_lock_tables[table_id] != nullptr); 
         unlock_remote = delay_fetch_local_page_lock_tables[table_id]->GetLock(page_id)->Pending(node_id, xpending); 
       }
+      else if(SYSTEM_MODE == 11){
+        assert(lazy_local_page_lock_tables[table_id] != nullptr && local_page_lock_tables[table_id] == nullptr);
+        unlock_remote = lazy_local_page_lock_tables[table_id]->GetLock(page_id)->Pending(node_id, xpending);
+      }
       else{
         assert(false);
       }
@@ -466,6 +517,10 @@ public:
       else if(SYSTEM_MODE == 7){  // phase switch + delay fetch + lazy release
         assert(delay_fetch_local_page_lock_tables[table_id] != nullptr && local_page_lock_tables[table_id] != nullptr); 
         delay_fetch_local_page_lock_tables[table_id]->GetLock(page_id)->RemoteNotifyLockSuccess(xlock, newest_node_id);
+      }
+      else if(SYSTEM_MODE == 11){
+        assert(lazy_local_page_lock_tables[table_id] != nullptr && local_page_lock_tables[table_id] == nullptr);
+        lazy_local_page_lock_tables[table_id]->GetLock(page_id)->RemoteNotifyLockSuccess(xlock, newest_node_id);
       }
       else{
         assert(false);
@@ -594,6 +649,11 @@ public:
     bool* threads_finish; //每个线程的运行结束状态，数组
     bool is_phase_switch_finish = false;
 
+public: // for star
+    std::unordered_map<table_id_t, std::unordered_map<page_id_t, std::list<page_id_t>::iterator>*> local_page_set;
+    std::unordered_map<table_id_t, std::list<page_id_t>*> lru_page_list;
+    std::mutex lru_latch_;
+
 public:
     std::condition_variable phase_switch_cv;
     std::mutex phase_switch_mutex;
@@ -604,6 +664,8 @@ public:
     std::atomic<int> stat_global_cnt = 0;
     std::atomic<int> stat_commit_partition_cnt = 0;
     std::atomic<int> stat_commit_global_cnt = 0;
+    std::atomic<int> stat_hit = 0;
+    std::atomic<int> stat_miss = 0;
     double partition_tps = 0;
     double global_tps = 0;
     int partition_ms = EpochTime * (1-CrossNodeAccessRatio);

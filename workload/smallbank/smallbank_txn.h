@@ -92,6 +92,19 @@ public:
     bool TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
     /******************** The business logic (Transaction) end ********************/
 
+    bool LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /* Calculate the sum of saving and checking kBalance */
+    bool LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /* Add $1.3 to acct_id's checking account */
+    bool LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
+    bool LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /* Add $20 to acct_id's saving's account */
+    bool LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /* Read saving and checking kBalance + update checking kBalance unconditionally */
+    bool LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned);
+    /******************** The long transaction logic (Transaction) end ********************/
+
 public:
     Amalgamate a1;
     Balance b1;

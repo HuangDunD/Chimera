@@ -613,7 +613,7 @@ public:
             node_id = gen_node_id;
         }
         if(ComputeNodeCount == 1) {
-            return (r.Next() % diff) + start;
+            return (r.Next() % (diff-1)) + 1;
         }
         if (diff == 1)
             return start;

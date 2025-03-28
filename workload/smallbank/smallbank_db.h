@@ -109,6 +109,7 @@ class SmallBank {
   uint32_t total_thread_num;
 
   uint32_t num_accounts_global, num_hot_global;
+  std::vector<std::vector<itemkey_t>> hot_accounts_vec; // only use for uniform hot setting
   double hot_rate;
 
   RmManager* rm_manager;
@@ -339,18 +340,92 @@ class SmallBank {
   }
 
 
+  /*
+   * Generators for new account IDs. Called once per transaction because
+   * we need to decide hot-or-not per transaction, not per account.
+   */
+    inline void get_uniform_hot_account(uint64_t* seed, uint64_t* acct_id,const DTX* dtx, bool is_partitioned, node_id_t gen_node_id, table_id_t table_id = 0) const {
+        if(is_partitioned){
+            if(FastRand(seed) % 100 < TX_HOT){ // 如果是热点事务
+                int hot_range = hot_accounts_vec[gen_node_id].size();
+                *acct_id = hot_accounts_vec[gen_node_id][FastRand(seed) % hot_range];
+            }else{
+                *acct_id = FastRand(seed) % (num_accounts_global / ComputeNodeCount) + gen_node_id * (num_accounts_global / ComputeNodeCount);
+            }
+        }else{
+            if(FastRand(seed) % 100 < TX_HOT){ 
+                int random = FastRand(seed) % (ComputeNodeCount - 1);
+                int hot_par = (random < gen_node_id ? random : random + 1);
+                int hot_range = hot_accounts_vec[hot_par].size();
+                *acct_id = hot_accounts_vec[hot_par][FastRand(seed) % hot_range];
+            }
+            else{
+                int random = FastRand(seed) % (ComputeNodeCount - 1);
+                int hot_par = (random < gen_node_id ? random : random + 1);
+                *acct_id = FastRand(seed) % (num_accounts_global / ComputeNodeCount) + hot_par * (num_accounts_global / ComputeNodeCount);
+            }
+        }
+    }
 
-  void LoadTable(node_id_t node_id, node_id_t num_server);
+    inline void get_uniform_hot_two_accounts(uint64_t* seed, uint64_t* acct_id_0, uint64_t* acct_id_1, const DTX* dtx, node_id_t gen_node_id, bool is_partitioned, table_id_t table_id = 0) const {
+        if(is_partitioned){
+            get_uniform_hot_account(seed, acct_id_0, dtx, is_partitioned, gen_node_id, table_id);
+            get_uniform_hot_account(seed, acct_id_1, dtx, is_partitioned, gen_node_id, table_id);
+            while (*acct_id_0 == *acct_id_1) {
+                get_uniform_hot_account(seed, acct_id_1, dtx, is_partitioned, gen_node_id, table_id);
+            }
+        }
+        else{
+            int node_id = gen_node_id;
+            get_uniform_hot_account(seed, acct_id_0, dtx, true, node_id, table_id);
+            get_uniform_hot_account(seed, acct_id_1, dtx, is_partitioned, node_id, table_id);
+            while (*acct_id_0 == *acct_id_1) {
+                get_uniform_hot_account(seed, acct_id_1, dtx, is_partitioned, node_id, table_id);
+            }
+        }
+    }
 
-  void PopulateSavingsTable();
 
-  void PopulateCheckingTable();
+    inline void GenerateHotAccounts(uint64_t* seed){
+        hot_accounts_vec.resize(ComputeNodeCount);
+        for(int i=0; i<ComputeNodeCount; i++){ 
+            // 为每个分区生成热点数据
+            int hot_num = num_hot_global / ComputeNodeCount; // 每个分区的热点数据
+            if(num_hot_global < (num_accounts_global / 56) && SYSTEM_MODE != 11){ // leap 特殊
+                itemkey_t key_off = 10;
+                for(int j=0; j<hot_num; j++){
+                    hot_accounts_vec[i].push_back(key_off + i * (num_accounts_global / ComputeNodeCount));
+                    key_off += 56;
+                }
+            }
+            else{
+                itemkey_t key_id;
+                for(int j=0; j<hot_num; j++){
+                    key_id = FastRand(seed) % (num_accounts_global / ComputeNodeCount);
+                    key_id += i * (num_accounts_global / ComputeNodeCount); 
+                    hot_accounts_vec[i].push_back(key_id); 
+                }
+            }
+        }
+        // // debug
+        // for(int i=0; i<ComputeNodeCount; i++){
+        //     for(int j=0; j<hot_accounts_vec[i].size(); j++){
+        //         std::cout << "node_id: " << i << " hot account: " << hot_accounts_vec[i][j] << std::endl;
+        //     }
+        // }
+    }
 
-  int LoadRecord(RmFileHandle* file_handle,
-                 itemkey_t item_key,
-                 void* val_ptr,
-                 size_t val_size,
-                 table_id_t table_id,
-                 std::ofstream& indexfile);
+    void LoadTable(node_id_t node_id, node_id_t num_server);
+
+    void PopulateSavingsTable();
+
+    void PopulateCheckingTable();
+
+    int LoadRecord(RmFileHandle* file_handle,
+                    itemkey_t item_key,
+                    void* val_ptr,
+                    size_t val_size,
+                    table_id_t table_id,
+                    std::ofstream& indexfile);
 
 };

@@ -6,6 +6,9 @@
 
 #define PAGE_SIZE 4096 // 16KB
 
+// # define PAGE_SIZE 128 // for leap smallbank
+// # define PAGE_SIZE 1024 // for leap tpcc
+
 #define REPLACER_TYPE "LRU"
 
 using page_id_t = int32_t;    // page id type
@@ -32,7 +35,7 @@ const uint64_t MEM_STORE_META_END = 0xE0FF0E0F;
 
 #define LOG_FILE_NAME "LOG_FILE"   
 // for log
-#define LOG_REPLAY_BUFFER_SIZE  (10 * PAGE_SIZE)                    // size of a log buffer in byte
+#define LOG_REPLAY_BUFFER_SIZE  (10 * 4096)                    // size of a log buffer in byte
 #define RM_BUFFER_POOL_SIZE 65536 // 256MB
 
 // for batch index prefetch

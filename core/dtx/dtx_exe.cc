@@ -7,6 +7,51 @@
 #include "exception.h"
 #include "compute_server/worker/global.h"
 
+void DTX::VarifyPhaseSwitch(coro_yield_t& yield){
+    // 判断是否需要切换
+  if(compute_server->get_node()->get_phase() == Phase::SWITCH_TO_GLOBAL || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_PAR){
+    if(*using_which_coro_sched == 0){
+      auto cur_epoch = compute_server->get_node()->epoch;
+      coro_sched_0->StopCoroutine(0);
+      assert(coro_sched_0->isAllCoroStopped()); // as only one coroutine
+      compute_server->get_node()->threads_switch[this->local_t_id] = true;
+      auto cid = new brpc::CallId();
+      this->SendLogToStoragePool(tx_id, cid);
+      brpc::Join(*cid);
+      // LOG(INFO) << "epoch: " << cur_epoch << "thread: " << this->local_t_id << " coro_sched_0->coro:" << this->coro_id <<" varify group commit..." ;
+      while(cur_epoch >= compute_server->get_node()->epoch); // wait for switch
+      for(coro_id_t coro_id=0; coro_id<this->coro_sched->getCoroNum(); coro_id++){
+        coro_sched->StartCoroutine(coro_id);
+      }
+      // LOG(INFO) << "coro_sched_0->RunCoroutine(yield, 0)";
+      *using_which_coro_sched = 1;
+      coro_sched->RunCoroutine(yield, 0);  // run coroutine 0
+    }
+    else{
+      auto cur_epoch = compute_server->get_node()->epoch;
+      coro_sched->StopCoroutine(coro_id); // stop this coroutine
+      while(!coro_sched->isAllCoroStopped() && cur_epoch >= compute_server->get_node()->epoch){
+        coro_sched->Yield(yield, coro_id);
+        // LOG(INFO) << "coro_id: " << coro_id << " is yielded";
+      }
+      if(coro_sched->isAllCoroStopped()){
+        compute_server->get_node()->threads_switch[this->local_t_id] = true; // stop and ready to switch
+        auto cid = new brpc::CallId();
+        this->SendLogToStoragePool(tx_id, cid);
+        brpc::Join(*cid);
+        // LOG(INFO) << "coro_sched_global->coro:" << this->coro_id <<" varify group commit..." ;
+      }
+      while(cur_epoch >= compute_server->get_node()->epoch); // wait for switch
+      if(coro_sched->isAllCoroStopped()){
+        // LOG(INFO) << "coro_sched_glogbal->StartCoroutine(0)";
+        coro_sched_0->StartCoroutine(0);
+        *using_which_coro_sched = 0;
+        coro_sched_0->RunCoroutine(yield, 0);
+      }
+    }
+  }
+}
+
 bool DTX::TxExe(coro_yield_t& yield, bool fail_abort) {
   // MV2PL+No-wait
   //  LOG(INFO) << "TxExe" ;
@@ -18,6 +63,11 @@ bool DTX::TxExe(coro_yield_t& yield, bool fail_abort) {
   try {
     // read read-only data
     for (size_t i=0; i<read_only_set.size(); i++) {
+# if SupportLongRunningTrans
+      if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
+        VarifyPhaseSwitch(yield);
+      }
+# endif
       DataSetItem& item = read_only_set[i];
       if (!item.is_fetched) {
         // Get data index
@@ -31,7 +81,7 @@ bool DTX::TxExe(coro_yield_t& yield, bool fail_abort) {
           continue;
         }
         // Fetch data from storage
-        if(SYSTEM_MODE <= 7){
+        if(SYSTEM_MODE <= 7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11 || SYSTEM_MODE == 12){
             struct timespec start_time1, end_time1;
             clock_gettime(CLOCK_REALTIME, &start_time1);
           auto data = FetchSPage(yield, item.item_ptr->table_id, rid.page_no_);
@@ -92,6 +142,11 @@ bool DTX::TxExe(coro_yield_t& yield, bool fail_abort) {
     for (size_t i=0; i<read_write_set.size(); i++) {
       DataSetItem& item = read_write_set[i];
       if (!item.is_fetched) {
+# if SupportLongRunningTrans
+      if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
+        VarifyPhaseSwitch(yield);
+      }
+# endif
         // Get data index
         Rid rid = GetRidFromIndexCache(item.item_ptr->table_id, item.item_ptr->key);
         if(rid.page_no_ == -1) {
@@ -103,7 +158,7 @@ bool DTX::TxExe(coro_yield_t& yield, bool fail_abort) {
           continue;
         }
         // Fetch data from storage
-        if(SYSTEM_MODE <= 7){
+        if(SYSTEM_MODE <= 7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11 || SYSTEM_MODE == 12){
             struct timespec start_time1, end_time1;
             clock_gettime(CLOCK_REALTIME, &start_time1);
           auto data = FetchXPage(yield, item.item_ptr->table_id, rid.page_no_);
@@ -205,7 +260,7 @@ bool DTX::TxCommit(coro_yield_t& yield){
   struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
     bool commit_status = false;
-  if(SYSTEM_MODE <= 7){
+  if(SYSTEM_MODE <= 7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11 || SYSTEM_MODE == 12){
     commit_status = TxCommitSingle(yield);
   }
   else if(SYSTEM_MODE == 8){
@@ -282,7 +337,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 void DTX::TxAbort(coro_yield_t& yield) {
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
-  if(SYSTEM_MODE <= 7){
+  if(SYSTEM_MODE <= 7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11 || SYSTEM_MODE == 12){
     // LOG(INFO) << "TxAbort";
     for(size_t i=0; i<read_write_set.size(); i++){
       DataSetItem& data_item = read_write_set[i];

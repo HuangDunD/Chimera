@@ -76,6 +76,7 @@ class DTX {
  public:
   DTX(MetaManager* meta_man,
       t_id_t tid,
+      t_id_t local_tid,
       coro_id_t coroid,
       CoroutineScheduler* sched,
       IndexCache* index_cache,
@@ -84,7 +85,9 @@ class DTX {
       brpc::Channel* data_channel,
       brpc::Channel* log_channel,
       brpc::Channel* remote_server_channel,
-      TxnLog* txn_log=nullptr);
+      TxnLog* txn_log=nullptr, 
+      CoroutineScheduler* sched_0=nullptr,
+      int* using_which_coro_sched_=nullptr);
   ~DTX() {
     Clean();
   }
@@ -164,10 +167,16 @@ class DTX {
   // for debug
   std::unordered_set<node_id_t> another_wait_ids;
   bool has_send_read_set = false;
+  // for long-running transactions
+  void VarifyPhaseSwitch(coro_yield_t& yield);
+  CoroutineScheduler* coro_sched_0;  // Thread local coroutine scheduler
+  int* using_which_coro_sched;
+  // GroupCommitInfo* group_commit_info;
 
  public:
   tx_id_t tx_id;  // Transaction ID
-  t_id_t t_id;  // Thread ID
+  t_id_t t_id;  // Thread ID(global)
+  t_id_t local_t_id;  // Thread ID(local)
   coro_id_t coro_id;  // Coroutine ID
   batch_id_t epoch_id; // epoch id
   uint64_t start_ts;    // start timestamp

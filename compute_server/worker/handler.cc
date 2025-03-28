@@ -54,6 +54,19 @@ void Handler::ConfigureComputeNode(int argc, char* argv[]) {
     LOCAL_TRASACTION_RATE = std::stod(argv[6]);
     CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
   }
+  else if(argc == 8){
+    // 最后一个参数输入长事务比例, 这样可以运行更快
+    assert(SupportLongRunningTrans == true);
+    std::string s2 = "sed -i '5c \"thread_num_per_machine\": " + std::string(argv[3]) + ",' " + config_file;
+    thread_num_per_node = std::stoi(argv[3]);
+    std::string s3 = "sed -i '6c \"coroutine_num\": " + std::string(argv[4]) + ",' " + config_file;
+    system(s2.c_str());
+    system(s3.c_str());
+    READONLY_TXN_RATE = std::stod(argv[5]);
+    LOCAL_TRASACTION_RATE = std::stod(argv[6]);
+    CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
+    LongTxnRate = std::stod(argv[7]);
+  }
 
   // read compute node count
   auto json_config = JsonConfig::load_file(config_file);
@@ -70,9 +83,9 @@ void Handler::ConfigureComputeNode(int argc, char* argv[]) {
     txn_system_value = 2;
   } else if (system_name.find("chimeraB") != std::string::npos) {
     txn_system_value = 3;
-  } else if (system_name.find("chimeraC") != std::string::npos) {
-    txn_system_value = 3;
-  } else if (system_name.find("chimeraD") != std::string::npos) {
+  } else if (system_name.find("chimeraC") != std::string::npos) { // not used
+    txn_system_value = 4;
+  } else if (system_name.find("chimeraD") != std::string::npos) { // not used
     txn_system_value = 5;
   } else if (system_name.find("chimeraE") != std::string::npos) {
     txn_system_value = 6;
@@ -82,6 +95,14 @@ void Handler::ConfigureComputeNode(int argc, char* argv[]) {
     txn_system_value = 8;
   } else if (system_name.find("2pc") != std::string::npos) {
     txn_system_value = 9;
+  } else if (system_name.find("single") != std::string::npos) {
+    txn_system_value = 10;
+  } else if (system_name.find("leap") != std::string::npos) {
+    txn_system_value = 11; // pay attention: need to modify the PAGE_SIZE in config.h
+  } else if (system_name.find("star") != std::string::npos) {
+    txn_system_value = 12; 
+  } else {
+    LOG(FATAL) << "Unsupported system name: " << system_name;
   }
   SYSTEM_MODE = txn_system_value;
   std::string s = "sed -i '7c \"txn_system\": " + std::to_string(txn_system_value) + ",' " + config_file;
@@ -141,6 +162,10 @@ void Handler::GenThreads(std::string bench_name) {
 
   if (bench_name == "smallbank") {
     smallbank_client = new SmallBank(nullptr);
+# if UniformHot 
+    uint64_t u_seed = 0xcafebabe;
+    smallbank_client->GenerateHotAccounts(&u_seed);
+# endif
     total_try_times.resize(SmallBank_TX_TYPES, 0);
     total_commit_times.resize(SmallBank_TX_TYPES, 0);
   } else if(bench_name == "tpcc") {
@@ -193,7 +218,7 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
   std::thread switch_thread;
-if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7){
+if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
   // 生成切换线程
   switch_thread = std::thread([compute_server](){
       // 修改线程名称
@@ -215,7 +240,7 @@ if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7)
     compute_server->rpc_lazy_release_all_page_new();
   }
 
-if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7){
+if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
   compute_server->get_node()->setNodeRunning(false);
   // 通知切换线程
   while (!compute_server->get_node()->is_phase_switch_finish) {
@@ -245,11 +270,15 @@ if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7)
       result_file << "hold_period_hit_ref: " << compute_server->get_node()->getHoldPrriodHitRef(0) << std::endl;
       result_file << "hold_period_hit_ref: " << compute_server->get_node()->getHoldPrriodHitRef(1) << std::endl;
   }
-  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE ==7) {
+  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE ==7 || SYSTEM_MODE == 12){ 
       result_file << "partition: " << compute_server->get_node()->stat_partition_cnt << std::endl;
       result_file << "global: " << compute_server->get_node()->stat_global_cnt << std::endl;
       result_file << "partition commit: " << compute_server->get_node()->stat_commit_partition_cnt << std::endl;
       result_file << "global commit: " << compute_server->get_node()->stat_commit_global_cnt << std::endl;
+  }
+  if(SYSTEM_MODE == 12) {
+      result_file << "star hit: " << compute_server->get_node()->stat_hit << std::endl;
+      result_file << "star miss: " << compute_server->get_node()->stat_miss << std::endl;
   }
   result_file << "fetch_all: " << *fetch_all_vec.rbegin() << std::endl;
   result_file << "fetch_remote: " << *fetch_remote_vec.rbegin() << std::endl;

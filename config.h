@@ -18,6 +18,8 @@
 #define MAX_ITEM_SIZE 8
 
 #define ComputeNodeBufferPageSize 262144 // 262144*4KB = 1GB
+// #define ComputeNodeBufferPageSize 2621440 // for leap
+
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)
 #define MaxComputeNodeCount 128
@@ -39,6 +41,7 @@ extern double LOCAL_TRASACTION_RATE;
 extern uint64_t ATTEMPTED_NUM;
 extern double CrossNodeAccessRatio;
 extern int delay_time;
+extern double LongTxnRate;
 
 #define MaxPartitionCount 1024
 
@@ -65,9 +68,16 @@ enum class OperationType {READ, WRITE};
 
 #define BatchTimeStamp 200 
 
+#define SupportLongRunningTrans true 
+#define UniformHot true
+
+#define LongTxnSize 10 // 长事务大小
+
 #define GroupCommit true
 
 #define WrongPrediction 0
+
+#define SINGLE_MISS_CACHE_RATE 0.875 // 7/8
 
 #define ATOM_FETCH_ADD(dest, value) __sync_fetch_and_add(&(dest), value)
 

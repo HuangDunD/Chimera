@@ -12,3 +12,4 @@ uint64_t ATTEMPTED_NUM = 1000;
 double CrossNodeAccessRatio = 0.1;
 int LOCK_MODE = NO_WAIT;
 int delay_time = 0;
+double LongTxnRate = 0.10;

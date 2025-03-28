@@ -35,6 +35,10 @@ class CoroutineScheduler {
 
   void RunCoroutine(coro_yield_t& yield, Coroutine* coro);
 
+  void RunCoroutine(coro_yield_t& yield, coro_id_t cid) {
+    RunCoroutine(yield, coro_array + cid);
+  }
+
   ALWAYS_INLINE
   void StopCoroutine(coro_id_t cid) {
     assert(working_coro_num > 0);
@@ -60,6 +64,9 @@ class CoroutineScheduler {
     return ret;
   }
   
+  ALWAYS_INLINE
+  coro_id_t getCoroNum() {return _coro_num;}
+
  public:
   Coroutine* coro_array;
 

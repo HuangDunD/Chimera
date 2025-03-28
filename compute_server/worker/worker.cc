@@ -79,6 +79,8 @@ __thread TPCCTxType* tpcc_workgen_arr;
 
 __thread coro_id_t coro_num;
 __thread CoroutineScheduler* coro_sched;  // Each transaction thread has a coroutine scheduler
+__thread CoroutineScheduler* coro_sched_0; // Coroutine 0, use a single sheduler to manage it, only use in long transactions evaluation
+__thread int* using_which_coro_sched; // 0=>coro_sched_0, 1=>coro_sched
 
 // Performance measurement (thread granularity)
 __thread struct timespec msr_start, msr_end;
@@ -165,12 +167,346 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   mux.unlock();
 }
 
+void RunSmallBankPSLong(coro_yield_t& yield, coro_id_t coro_id) {
+  // Each coroutine has a dtx: Each coroutine is a coordinator
+  struct timespec tx_end_time;
+  bool tx_committed = false;
+  DTX* dtx = new DTX(meta_man,
+                     thread_gid,
+                     thread_local_id,
+                     coro_id,
+                     coro_sched,
+                     index_cache,
+                     page_cache,
+                     compute_server,
+                     data_channel,
+                     log_channel,
+                     remote_server_channel,
+                     thread_txn_log, coro_sched_0, using_which_coro_sched);
+  SmallBankDTX* bench_dtx = new SmallBankDTX();
+  bench_dtx->dtx = dtx;
+  dtx->bdtx = bench_dtx;
+  // Running transactions
+  clock_gettime(CLOCK_REALTIME, &msr_start);
+  assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12);
+
+  while(compute_server->get_node()->get_phase() == Phase::BEGIN);
+  while (true) {
+    int cur_epoch = compute_server->get_node()->epoch;
+    if(compute_server->get_node()->get_phase() == Phase::SWITCH_TO_GLOBAL || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_PAR){
+      if(*using_which_coro_sched == 0){
+        coro_sched_0->StopCoroutine(0);
+        assert(coro_sched_0->isAllCoroStopped()); // as only one coroutine
+        compute_server->get_node()->threads_switch[thread_local_id] = true;
+        struct timespec now_time;
+        clock_gettime(CLOCK_REALTIME, &now_time);
+        auto cid = new brpc::CallId();
+        dtx->SendLogToStoragePool(dtx->tx_id, cid);
+        brpc::Join(*cid);
+        just_group_commit = true;
+        last_commit_log_ts = now_time;
+        // LOG(INFO) << "group commit..." ;
+        if (just_group_commit) {
+          clock_gettime(CLOCK_REALTIME, &tx_end_time);
+          for(auto r: *txn_request_infos){
+            double tx_usec = (tx_end_time.tv_sec - r.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - r.start_time.tv_nsec) / 1000;
+            timer[stat_committed_tx_total++] = tx_usec;
+          }
+          txn_request_infos->clear();
+          just_group_commit = false;
+        }
+        while(cur_epoch >= compute_server->get_node()->epoch); // wait for switch
+        for(coro_id_t coro_id=0; coro_id<coro_num; coro_id++){
+          coro_sched->StartCoroutine(coro_id);
+        }
+        *using_which_coro_sched = 1;
+        coro_sched->RunCoroutine(yield, 0); // run coroutine 0
+        continue;
+      }
+      else{
+        coro_sched->StopCoroutine(coro_id); // stop this coroutine
+        while(!coro_sched->isAllCoroStopped() && cur_epoch >= compute_server->get_node()->epoch){
+          coro_sched->Yield(yield, coro_id);
+          // LOG(INFO) << "coro_id: " << coro_id << " is yielded";
+        }
+        if(coro_sched->isAllCoroStopped()){
+          compute_server->get_node()->threads_switch[thread_local_id] = true; // stop and ready to switch
+          struct timespec now_time;
+          clock_gettime(CLOCK_REALTIME, &now_time);
+          auto cid = new brpc::CallId();
+          dtx->SendLogToStoragePool(dtx->tx_id, cid);
+          brpc::Join(*cid);
+          just_group_commit = true;
+          last_commit_log_ts = now_time;
+          // LOG(INFO) << "group commit..." ;
+          if (just_group_commit) {
+            clock_gettime(CLOCK_REALTIME, &tx_end_time);
+            for(auto r: *txn_request_infos){
+              double tx_usec = (tx_end_time.tv_sec - r.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - r.start_time.tv_nsec) / 1000;
+              timer[stat_committed_tx_total++] = tx_usec;
+            }
+            txn_request_infos->clear();
+            just_group_commit = false;
+          }
+        }
+        while(cur_epoch >= compute_server->get_node()->epoch); // wait for switch
+        if(coro_sched->isAllCoroStopped()){
+          coro_sched_0->StartCoroutine(0);
+          *using_which_coro_sched = 0;
+          coro_sched_0->RunCoroutine(yield, 0);
+          continue;
+        }
+      }
+    }
+
+    // run transaction
+    bool fill_txn = false;
+    Txn_request_info txn_meta;
+    bool is_par_txn;
+    if(compute_server->get_node()->get_phase() == Phase::PARTITION || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_GLOBAL){
+      // 判断partitioned_txn_list是否为空, 如果为空则生成新的page id
+      is_par_txn = true;
+      std::unique_lock<std::mutex> l(compute_server->get_node()->getTxnQueueMutex());
+      if(!compute_server->get_node()->get_partitioned_txn_queue().empty()){
+        // 从partitioned_txn_list取出一个seed
+        txn_meta = compute_server->get_node()->get_partitioned_txn_queue().front();
+        compute_server->get_node()->get_partitioned_txn_queue().pop();
+        fill_txn = true;
+      }
+      else {
+        // 生成一个partitioned txn
+        bool is_partitioned = FastRand(&seed) % 100 < (LOCAL_TRASACTION_RATE * 100); // local transaction rate
+        if(!is_partitioned){
+          if(compute_server->get_node()->get_global_txn_queue().size() >= (size_t)compute_server->get_node()->max_global_txn_queue) continue;
+          // push back to global_txn_list
+          txn_meta.seed = FastRand(&seed); // 暂存seed
+          clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
+          compute_server->get_node()->get_global_txn_queue().push(txn_meta);
+        }
+        else {
+          txn_meta.seed = FastRand(&seed); // 暂存seed
+          clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
+          fill_txn = true;
+        }
+      }
+    }
+    else if(compute_server->get_node()->get_phase() == Phase::GLOBAL || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_PAR){
+      // 判断global_txn_list是否为空, 如果为空则生成新的page id
+      is_par_txn = false;
+      std::unique_lock<std::mutex> l(compute_server->get_node()->getTxnQueueMutex());
+      if(!compute_server->get_node()->get_global_txn_queue().empty()){
+        // 从global_txn_list取出一个seed
+        txn_meta = compute_server->get_node()->get_global_txn_queue().front();
+        compute_server->get_node()->get_global_txn_queue().pop();
+        fill_txn = true;
+      }
+      else {
+        // 生成一个global txn
+        bool is_partitioned = FastRand(&seed) % 100 < (LOCAL_TRASACTION_RATE * 100); // local transaction rate
+        if(is_partitioned){
+          if(compute_server->get_node()->get_partitioned_txn_queue().size() >= (size_t)compute_server->get_node()->max_par_txn_queue) continue;
+          // push back to partitioned_txn_list
+          txn_meta.seed = FastRand(&seed); // 暂存seed
+          clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
+          compute_server->get_node()->get_partitioned_txn_queue().push(txn_meta);
+        }
+        else {
+          txn_meta.seed = FastRand(&seed); // 暂存seed
+          clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
+          fill_txn = true;
+        }
+      }
+    }
+    else assert(false);
+    
+    for(int i = 0; i < 5; i++){
+      FastRand(&seed); // 更新seed, 防止生成相同的seed, 为每个事务分配了5个seed
+    }
+    if(!fill_txn) continue;
+
+    SmallBankTxType tx_type = smallbank_workgen_arr[FastRand(&seed) % 100];
+    uint64_t iter = ++tx_id_generator;  // Global atomic transaction id
+    stat_attempted_tx_total++;
+    
+    // TLOG(INFO, thread_gid) << "tx: " << iter << " coroutine: " << coro_id << " tx_type: " << (int)tx_type;
+    // printf("worker.cc:326, start a new txn\n");
+    if(is_par_txn) {
+      compute_server->get_node()->partition_cnt++;
+      compute_server->get_node()->stat_partition_cnt++;
+      // // ! 与原写法不同，暂时
+      // if(compute_server->get_node()->partition_cnt >= EpochOptCount*(1-CrossNodeAccessRatio)){
+      //     // 通知切换线程
+      //     std::unique_lock<std::mutex> lck(compute_server->get_node()->phase_switch_mutex);
+      //     compute_server->get_node()->phase_switch_cv.notify_one();
+      // }
+    }
+    else{
+      compute_server->get_node()->global_cnt++;
+      compute_server->get_node()->stat_global_cnt++;
+      // // ! 与原写法不同，暂时
+      // if(compute_server->get_node()->global_cnt >= EpochOptCount*CrossNodeAccessRatio){
+      //     // 通知切换线程
+      //     std::unique_lock<std::mutex> lck(compute_server->get_node()->phase_switch_mutex);
+      //     compute_server->get_node()->phase_switch_cv.notify_one();
+      // }
+    }
+    
+    switch (tx_type) {
+      case SmallBankTxType::kAmalgamate: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxAmalgamate(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kBalance: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxBalance(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kDepositChecking: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxDepositChecking(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kSendPayment: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxSendPayment(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kTransactSaving: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxTransactSaving(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kWriteCheck: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxWriteCheck(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          } else{
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &txn_meta.seed, yield, iter, dtx, is_par_txn);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      default:
+        printf("Unexpected transaction type %d\n", static_cast<int>(tx_type));
+        abort();
+    }
+    /********************************** Stat begin *****************************************/
+    // Stat after one transaction finishes
+    // printf("try %d transaction commit? %s\n", stat_attempted_tx_total, tx_committed?"true":"false");
+  #if !GroupCommit
+    if (tx_committed) {
+      clock_gettime(CLOCK_REALTIME, &tx_end_time);
+      double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
+      timer[stat_committed_tx_total++] = tx_usec;
+    }
+  #else
+    if(SYSTEM_MODE <=7){
+      if(is_par_txn){
+        // 增加一个误判记录
+        if(FastRand(&seed) % 100 < WrongPrediction * 100){
+          compute_server->get_node()->partition_cnt--;
+          tx_committed = false;
+          thread_local_commit_times[uint64_t(tx_type)]--;
+        }
+      }
+      if (tx_committed) {
+        // 记录事务开始时间
+        txn_request_infos->push_back(txn_meta);
+        if(is_par_txn){
+          compute_server->get_node()->stat_commit_partition_cnt++;
+        } else{
+          compute_server->get_node()->stat_commit_global_cnt++;
+        }
+      }
+      else{
+        if(is_par_txn){
+          compute_server->get_node()->partition_cnt--;
+        } else{
+          compute_server->get_node()->global_cnt--;
+        }
+      }
+      stat_enter_commit_tx_total++;
+    }
+    else assert(false);
+  #endif
+    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+  #if GroupCommit
+    if(SYSTEM_MODE <=7){
+      struct timespec now_time;
+      clock_gettime(CLOCK_REALTIME, &now_time);
+      auto cid = new brpc::CallId();
+        dtx->SendLogToStoragePool(dtx->tx_id, cid);
+        brpc::Join(*cid);
+        just_group_commit = true;
+        last_commit_log_ts = now_time;
+      clock_gettime(CLOCK_REALTIME, &tx_end_time);
+        for(auto r: *txn_request_infos){
+          double tx_usec = (tx_end_time.tv_sec - r.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - r.start_time.tv_nsec) / 1000;
+          timer[stat_committed_tx_total++] = tx_usec;
+        }
+      txn_request_infos->clear();
+      just_group_commit = false;
+    }
+  #endif
+      break;
+    }
+    // coro_sched->Yield(yield, coro_id);
+  }
+    /********************************** Stat end *****************************************/
+  // remove from the coroutine scheduler
+  if(*using_which_coro_sched == 0){
+    coro_sched_0->FinishCorotine(0);
+  }else{
+    coro_sched->FinishCorotine(coro_id);
+    LOG(INFO) << "thread_local_id: " << thread_local_id << " coro_id: " << coro_id << " is stopped";
+    while(coro_sched->isAllCoroStopped() == false) {
+        // LOG(INFO) << coro_id << " *yield ";
+        coro_sched->Yield(yield, coro_id);
+    }
+  }
+  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12) 
+        compute_server->get_node()->threads_finish[thread_local_id] = true;
+  // A coroutine calculate the total execution time and exits
+  clock_gettime(CLOCK_REALTIME, &msr_end);
+  // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
+  double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
+  RecordTpLat(msr_sec,dtx);
+  delete bench_dtx;
+}
+
 void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
   // Each coroutine has a dtx: Each coroutine is a coordinator
   struct timespec tx_end_time;
   bool tx_committed = false;
   DTX* dtx = new DTX(meta_man,
                      thread_gid,
+                     thread_local_id,
                      coro_id,
                      coro_sched,
                      index_cache,
@@ -185,12 +521,15 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
   dtx->bdtx = bench_dtx;
   // Running transactions
   clock_gettime(CLOCK_REALTIME, &msr_start);
-  assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7);
+  assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12);
 
   while(compute_server->get_node()->get_phase() == Phase::BEGIN);
   while (true) {
 
     int cur_epoch = compute_server->get_node()->epoch;
+    if(SYSTEM_MODE == 12 && compute_server->get_node()->get_phase() == Phase::GLOBAL && compute_server->get_node()->getNodeID() != 0){
+       continue; // star
+    }
     // 判断是否需要切换
     if(compute_server->get_node()->get_phase() == Phase::SWITCH_TO_GLOBAL || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_PAR){
         // LOG(INFO) << "Node " << compute_server->get_node()->getNodeID() << " Thread " << thread_local_id << " is ready to switch";
@@ -253,7 +592,7 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
         // 生成一个partitioned txn
         bool is_partitioned = FastRand(&seed) % 100 < (LOCAL_TRASACTION_RATE * 100); // local transaction rate
         if(!is_partitioned){
-          if(compute_server->get_node()->get_global_txn_queue().size() >= compute_server->get_node()->max_global_txn_queue) continue;
+          if(compute_server->get_node()->get_global_txn_queue().size() >= (size_t)compute_server->get_node()->max_global_txn_queue) continue;
           // push back to global_txn_list
           txn_meta.seed = FastRand(&seed); // 暂存seed
           clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
@@ -280,7 +619,7 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
         // 生成一个global txn
         bool is_partitioned = FastRand(&seed) % 100 < (LOCAL_TRASACTION_RATE * 100); // local transaction rate
         if(is_partitioned){
-          if(compute_server->get_node()->get_partitioned_txn_queue().size() >= compute_server->get_node()->max_par_txn_queue) continue;
+          if(compute_server->get_node()->get_partitioned_txn_queue().size() >= (size_t)compute_server->get_node()->max_par_txn_queue) continue;
           // push back to partitioned_txn_list
           txn_meta.seed = FastRand(&seed); // 暂存seed
           clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
@@ -378,7 +717,7 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
       timer[stat_committed_tx_total++] = tx_usec;
     }
   #else
-    if(SYSTEM_MODE <=7){
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 12){
       if(is_par_txn){
         // 增加一个误判记录
         if(FastRand(&seed) % 100 < WrongPrediction * 100){
@@ -407,9 +746,9 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
     }
     else assert(false);
   #endif
-    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM || (SYSTEM_MODE == 12 && compute_server->get_node()->getNodeID() != 0 && stat_enter_commit_tx_total >= ATTEMPTED_NUM * (1-CrossNodeAccessRatio))) {
   #if GroupCommit
-    if(SYSTEM_MODE <=7){
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 12){
       struct timespec now_time;
       clock_gettime(CLOCK_REALTIME, &now_time);
       auto cid = new brpc::CallId();
@@ -438,8 +777,190 @@ void RunSmallBankPS(coro_yield_t& yield, coro_id_t coro_id) {
       // LOG(INFO) << coro_id << " *yield ";
       coro_sched->Yield(yield, coro_id);
   }
-  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7)
+  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12) 
         compute_server->get_node()->threads_finish[thread_local_id] = true;
+  // A coroutine calculate the total execution time and exits
+  clock_gettime(CLOCK_REALTIME, &msr_end);
+  // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
+  double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
+  RecordTpLat(msr_sec,dtx);
+  delete bench_dtx;
+}
+
+void RunSmallBankLong(coro_yield_t& yield, coro_id_t coro_id) {
+  // Each coroutine has a dtx: Each coroutine is a coordinator
+  struct timespec tx_end_time;
+  bool tx_committed = false;
+
+  DTX* dtx = new DTX(meta_man,
+                     thread_gid,
+                     thread_local_id,
+                     coro_id,
+                     coro_sched,
+                     index_cache,
+                     page_cache,
+                     compute_server,
+                     data_channel,
+                     log_channel,
+                     remote_server_channel,
+                     thread_txn_log);
+  // Running transactions
+  clock_gettime(CLOCK_REALTIME, &msr_start);
+  SmallBankDTX* bench_dtx = new SmallBankDTX();
+  bench_dtx->dtx = dtx;
+  dtx->bdtx = bench_dtx;
+  while (true) {
+    bool is_partitioned = FastRand(&seed) % 100 < (LOCAL_TRASACTION_RATE * 100); // local transaction rate
+    SmallBankTxType tx_type = smallbank_workgen_arr[FastRand(&seed) % 100];
+    uint64_t iter = ++tx_id_generator;  // Global atomic transaction id
+    stat_attempted_tx_total++;
+
+    // TLOG(INFO, thread_gid) << "tx: " << iter << " coroutine: " << coro_id << " tx_type: " << (int)tx_type;
+    
+    Txn_request_info txn_meta;
+    clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
+
+    // printf("worker.cc:326, start a new txn\n");
+    switch (tx_type) {
+      case SmallBankTxType::kAmalgamate: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxAmalgamate(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kBalance: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxBalance(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kDepositChecking: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxDepositChecking(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kSendPayment: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxSendPayment(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kTransactSaving: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxTransactSaving(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      case SmallBankTxType::kWriteCheck: {
+          thread_local_try_times[uint64_t(tx_type)]++;
+          if(FastRand(&seed) % 100 < LongTxnRate * 100){ // is long transaction
+            tx_committed = bench_dtx->LongTxWriteCheck(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          } else{
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &seed, yield, iter, dtx, is_partitioned);
+          }
+          if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
+        break;
+      }
+      default:
+        printf("Unexpected transaction type %d\n", static_cast<int>(tx_type));
+        abort();
+    }
+    /********************************** Stat begin *****************************************/
+    // Stat after one transaction finishes
+    // printf("try %d transaction commit? %s\n", stat_attempted_tx_total, tx_committed?"true":"false");
+  #if !GroupCommit
+    if (tx_committed) {
+      clock_gettime(CLOCK_REALTIME, &tx_end_time);
+      double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
+      timer[stat_committed_tx_total++] = tx_usec;
+    }
+  #else
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
+      if (tx_committed) {
+        // 记录事务开始时间
+        txn_request_infos->push_back(txn_meta);
+      }
+      stat_enter_commit_tx_total++;
+      struct timespec now_time;
+      clock_gettime(CLOCK_REALTIME, &now_time);
+      auto diff_ms = (now_time.tv_sec - last_commit_log_ts.tv_sec)* 1000LL + (double)(now_time.tv_nsec - last_commit_log_ts.tv_nsec) / 1000000;
+      if(diff_ms >= EpochTime){
+        auto cid = new brpc::CallId();
+        dtx->SendLogToStoragePool(dtx->tx_id, cid);
+        brpc::Join(*cid);
+        just_group_commit = true;
+        last_commit_log_ts = now_time;
+        // LOG(INFO) << "group commit..." ;
+      }
+      if (just_group_commit) {
+        clock_gettime(CLOCK_REALTIME, &tx_end_time);
+        for(auto r: *txn_request_infos){
+          double tx_usec = (tx_end_time.tv_sec - r.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - r.start_time.tv_nsec) / 1000;
+          timer[stat_committed_tx_total++] = tx_usec;
+        }
+        txn_request_infos->clear();
+        just_group_commit = false;
+      }
+    }
+    else if(SYSTEM_MODE == 9){
+      if (tx_committed) {
+        clock_gettime(CLOCK_REALTIME, &tx_end_time);
+        double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
+        timer[stat_committed_tx_total++] = tx_usec + dtx->two_latency_c * 1000;
+      }
+    }
+  #endif
+    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+  #if GroupCommit
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
+      struct timespec now_time;
+      clock_gettime(CLOCK_REALTIME, &now_time);
+      auto cid = new brpc::CallId();
+        dtx->SendLogToStoragePool(dtx->tx_id, cid);
+        brpc::Join(*cid);
+        just_group_commit = true;
+        last_commit_log_ts = now_time;
+      clock_gettime(CLOCK_REALTIME, &tx_end_time);
+        for(auto r: *txn_request_infos){
+          double tx_usec = (tx_end_time.tv_sec - r.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - r.start_time.tv_nsec) / 1000;
+          timer[stat_committed_tx_total++] = tx_usec;
+        }
+      txn_request_infos->clear();
+      just_group_commit = false;
+    }
+  #endif
+      break;
+    }
+    /********************************** Stat end *****************************************/
+    coro_sched->Yield(yield, coro_id);
+  }
+  coro_sched->FinishCorotine(coro_id);
+  LOG(INFO) << "thread_local_id: " << thread_local_id << " coro_id: " << coro_id << " is stopped";
+  while(coro_sched->isAllCoroStopped() == false) {
+      // LOG(INFO) << coro_id << " *yield ";
+      coro_sched->Yield(yield, coro_id);
+  }
   // A coroutine calculate the total execution time and exits
   clock_gettime(CLOCK_REALTIME, &msr_end);
   // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
@@ -455,6 +976,7 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
 
   DTX* dtx = new DTX(meta_man,
                      thread_gid,
+                     thread_local_id,
                      coro_id,
                      coro_sched,
                      index_cache,
@@ -532,7 +1054,7 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       timer[stat_committed_tx_total++] = tx_usec;
     }
   #else
-    if(SYSTEM_MODE <=7){
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
       if (tx_committed) {
         // 记录事务开始时间
         txn_request_infos->push_back(txn_meta);
@@ -569,7 +1091,7 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
   #endif
     if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
   #if GroupCommit
-    if(SYSTEM_MODE <=7){
+    if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
       struct timespec now_time;
       clock_gettime(CLOCK_REALTIME, &now_time);
       auto cid = new brpc::CallId();
@@ -718,6 +1240,7 @@ void GenerateSmmallBankFromRemote(coro_yield_t& yield, coro_id_t coro_id) {
     for (int i = 0; i < entry->txns.size(); i++) {
       DTX* dtx = new DTX(meta_man,
                      thread_gid,
+                     thread_local_id,
                      coro_id,
                      coro_sched,
                      index_cache,
@@ -809,6 +1332,7 @@ void GenerateSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
     // 若没有满，则生成新事务
     DTX* dtx = new DTX(meta_man,
                      thread_gid,
+                     thread_local_id,
                      coro_id,
                      coro_sched,
                      index_cache,
@@ -1068,6 +1592,7 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
     // Each coroutine has a dtx: Each coroutine is a coordinator
     DTX* dtx = new DTX(meta_man,
                        thread_gid,
+                       thread_local_id,
                        coro_id,
                        coro_sched,
                        index_cache,
@@ -1082,11 +1607,15 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
 
     // Running transactions
     clock_gettime(CLOCK_REALTIME, &msr_start);
-
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12);
+    
     while(compute_server->get_node()->get_phase() == Phase::BEGIN);
     while (true) {
       // 判断是否需要切换
       int cur_epoch = compute_server->get_node()->epoch;
+      if(SYSTEM_MODE == 12 && compute_server->get_node()->get_phase() == Phase::GLOBAL && compute_server->get_node()->getNodeID() != 0){
+        continue; // star
+      }
       if(compute_server->get_node()->get_phase() == Phase::SWITCH_TO_GLOBAL || compute_server->get_node()->get_phase() == Phase::SWITCH_TO_PAR){
           // LOG(INFO) << "Node " << compute_server->get_node()->getNodeID() << " Thread " << thread_local_id << " is ready to switch";
           coro_sched->StopCoroutine(coro_id); // stop this coroutine
@@ -1274,7 +1803,7 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
           timer[stat_committed_tx_total++] = tx_usec;
         }
       #else
-        if(SYSTEM_MODE <=7){
+        if(SYSTEM_MODE <=7 || SYSTEM_MODE == 12){
           if (tx_committed) {
             // 记录事务开始时间
             txn_request_infos->push_back(txn_meta);
@@ -1295,9 +1824,9 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
         }
         else assert(false);
       #endif
-        if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+        if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM || (SYSTEM_MODE == 12 && compute_server->get_node()->getNodeID() != 0 && stat_enter_commit_tx_total >= ATTEMPTED_NUM * (1-CrossNodeAccessRatio))) {
       #if GroupCommit
-        if(SYSTEM_MODE <=7){
+        if(SYSTEM_MODE <=7 || SYSTEM_MODE == 12){
           struct timespec now_time;
           clock_gettime(CLOCK_REALTIME, &now_time);
           auto cid = new brpc::CallId();
@@ -1313,6 +1842,7 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
           txn_request_infos->clear();
           just_group_commit = false;
         }
+        else assert(false);
       #endif
           break;
         }
@@ -1324,7 +1854,7 @@ void RunTPCCPS(coro_yield_t& yield, coro_id_t coro_id) {
         // LOG(INFO) << coro_id << " *yield ";
         coro_sched->Yield(yield, coro_id);
     }
-    if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7)
+    if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12)
         compute_server->get_node()->threads_finish[thread_local_id] = true;
     // A coroutine calculate the total execution time and exits
     clock_gettime(CLOCK_REALTIME, &msr_end);
@@ -1338,6 +1868,7 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
     // Each coroutine has a dtx: Each coroutine is a coordinator
     DTX* dtx = new DTX(meta_man,
                        thread_gid,
+                       thread_local_id,
                        coro_id,
                        coro_sched,
                        index_cache,
@@ -1416,7 +1947,7 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
           timer[stat_committed_tx_total++] = tx_usec;
         }
       #else
-        if(SYSTEM_MODE <=7){
+        if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
           if (tx_committed) {
             // 记录事务开始时间
             txn_request_infos->push_back(txn_meta);
@@ -1453,7 +1984,7 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
       #endif
         if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
       #if GroupCommit
-        if(SYSTEM_MODE <=7){
+        if(SYSTEM_MODE <=7 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
           struct timespec now_time;
           clock_gettime(CLOCK_REALTIME, &now_time);
           auto cid = new brpc::CallId();
@@ -1540,6 +2071,20 @@ void run_thread(thread_params* params,
       delay_time = DelayFetchTime;
     }
   }
+
+#if SupportLongRunningTrans 
+  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
+    coro_sched_0 = new CoroutineScheduler(thread_gid, 1);
+    using_which_coro_sched = new int(0);
+    if (bench_name == "smallbank") {
+      coro_sched_0->coro_array[0].func = coro_call_t(bind(RunSmallBankPSLong, _1, 0));
+    } else if (bench_name == "tpcc") {
+      coro_sched_0->coro_array[0].func = coro_call_t(bind(RunTPCCPS, _1, 0));
+    } else {
+      LOG(FATAL) << "Unsupported benchmark: " << bench_name;
+    }
+  }
+#endif
   coro_sched = new CoroutineScheduler(thread_gid, coro_num);
 
   timer = new double[ATTEMPTED_NUM+50]();
@@ -1565,11 +2110,19 @@ void run_thread(thread_params* params,
     coro_sched->coro_array[coro_i].coro_id = coro_i;
     // Bind workload to coroutine
     if (bench_name == "smallbank") {
-      if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 4 || SYSTEM_MODE == 6 || SYSTEM_MODE == 9){
+      if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 4 || SYSTEM_MODE == 6 || SYSTEM_MODE == 9 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
+    #if SupportLongRunningTrans
+        coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBankLong, _1, coro_i));
+    #else
         coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBank, _1, coro_i));
+    #endif
       }
-      else if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7){
+      else if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
+    #if SupportLongRunningTrans 
+        coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBankPSLong, _1, coro_i));
+    #else
         coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBankPS, _1, coro_i));
+    #endif
       } 
       else if (SYSTEM_MODE == 8) { // CALVIN
         if (thread_local_id == 0) {
@@ -1582,10 +2135,10 @@ void run_thread(thread_params* params,
         else coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunWorker, _1, coro_i));
       }
     } else if (bench_name == "tpcc") {
-      if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 4 || SYSTEM_MODE == 6 || SYSTEM_MODE == 9){
+      if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 4 || SYSTEM_MODE == 6 || SYSTEM_MODE == 9 || SYSTEM_MODE == 10 || SYSTEM_MODE == 11){
         coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunTPCC, _1, coro_i));
       }
-      else if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7){
+      else if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
         coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunTPCCPS, _1, coro_i));
       }
       // else if (SYSTEM_MODE == 8) { // CALVIN
@@ -1627,11 +2180,26 @@ void run_thread(thread_params* params,
   
   // // Link all coroutines via pointers in a loop manner
   // coro_sched->LoopLinkCoroutine(coro_num);
+#if SupportLongRunningTrans
+  if(SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 5 || SYSTEM_MODE == 7 || SYSTEM_MODE == 12){
+    coro_sched_0->StartCoroutine(0);
+    coro_sched_0->coro_array[0].func();
+    *using_which_coro_sched = 0;
+  }
+  else{
+    for(coro_id_t coro_i = 0; coro_i < coro_num; coro_i++){
+      coro_sched->StartCoroutine(coro_i); // Start all coroutines
+    }
+    // Start the first coroutine
+    coro_sched->coro_array[0].func();
+  }
+#else
   for(coro_id_t coro_i = 0; coro_i < coro_num; coro_i++){
     coro_sched->StartCoroutine(coro_i); // Start all coroutines
   }
   // Start the first coroutine
   coro_sched->coro_array[0].func();
+#endif
 
   // Wait for all coroutines to finish
 

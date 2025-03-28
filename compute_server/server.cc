@@ -122,10 +122,12 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
                     LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
                 }
                 //! unlock remote ok and unlatch local
-                if(SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
+                if(SYSTEM_MODE == 1 || SYSTEM_MODE == 3 || SYSTEM_MODE == 11){
                     server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockRemoteOK();
                 }else if(SYSTEM_MODE == 6 || SYSTEM_MODE == 7){
                     server->get_node()->getDelayFetchPageLockTable(table_id)->GetLock(page_id)->UnlockRemoteOK();
+                }else{
+                    assert(false);
                 }
                 // delete response;
                 delete unlock_response;
@@ -333,6 +335,44 @@ void ComputeServer::rpc_phase_switch_get_invalid_pages_new(){
     return;
 }
 
+void ComputeServer::rpc_phase_switch_sync_invalid_pages_new(){
+    auto table_size = node_->meta_manager_->GetTableNum();
+    partition_table_service::GetInvalidRequest get_invalid_request;
+    partition_table_service::GetInvalidResponse get_invalid_response;
+    partition_table_service::PartitionTableService_Stub partition_table_stub(get_pagetable_channel());
+    get_invalid_request.set_node_id(this->get_node()->getNodeID());
+    for(int table_id = 0; table_id < table_size; table_id++){
+        auto page_size = get_partitioned_size(table_id);
+        int start_pageid = node_->node_id * page_size;
+        int end_pageid = (node_->node_id + 1) * page_size;
+        get_invalid_request.add_table_id(table_id);
+        get_invalid_request.add_start_page_no(start_pageid);
+        get_invalid_request.add_end_page_no(end_pageid);
+    }
+    brpc::Controller cntl;
+    partition_table_stub.GetInvalid(&cntl, &get_invalid_request, &get_invalid_response, NULL);
+    if(cntl.Failed()){
+        LOG(ERROR) << "Fail to get invalid pages from remote partition table";
+    }
+    assert(get_invalid_response.invalid_page_no_size() == get_invalid_response.newest_node_id_size());
+    assert(get_invalid_response.invalid_page_no_size() == get_invalid_response.table_id_size());
+    for(int i = 0; i < get_invalid_response.invalid_page_no_size(); i++){
+        int table_id = get_invalid_response.table_id(i);
+        int page_id = get_invalid_response.invalid_page_no(i);
+        int node_id = get_invalid_response.newest_node_id(i);
+        assert(node_id != -1);
+        // sync invalid page
+        Page* page = node_->local_buffer_pools[table_id]->pages_ + page_id;
+        if(node_id != -1){
+            // 从远程更新数据页
+            UpdatePageFromRemoteComputeNew(page, table_id, page_id, node_id);
+            node_->local_page_lock_tables[table_id]->GetLock(page_id)->UpdateLocalOK();
+        }
+        node_->local_page_lock_tables[table_id]->GetLock(page_id)->SetNewestNode(-1); // update finish
+    }
+    return;
+}
+
 void ComputeServer::rpc_phase_switch_invalid_pages_new(){
     partition_table_service::InvalidPagesRequest invalid_request;
     partition_table_service::PartitionTableService_Stub partition_table_stub(get_pagetable_channel());
@@ -361,6 +401,44 @@ void ComputeServer::rpc_phase_switch_invalid_pages_new(){
     }
     delete invalid_response;
     return;
+}
+
+void ComputeServer::InitTableNameMeta(){
+    if(WORKLOAD_MODE == 0){
+        table_name_meta.resize(2);
+        table_name_meta[0] = "../storage_server/smallbank_savings";
+        table_name_meta[1] = "../storage_server/smallbank_checking";
+    }
+    else if(WORKLOAD_MODE == 1){
+        table_name_meta.resize(11);
+        table_name_meta[0] = "../storage_server/TPCC_warehouse";
+        table_name_meta[1] = "../storage_server/TPCC_district";
+        table_name_meta[2] = "../storage_server/TPCC_customer";
+        table_name_meta[3] = "../storage_server/TPCC_customerhistory";
+        table_name_meta[4] = "../storage_server/TPCC_ordernew";
+        table_name_meta[5] = "../storage_server/TPCC_order";
+        table_name_meta[6] = "../storage_server/TPCC_orderline";
+        table_name_meta[7] = "../storage_server/TPCC_item";
+        table_name_meta[8] = "../storage_server/TPCC_stock";
+        table_name_meta[9] = "../storage_server/TPCC_customerindex";
+        table_name_meta[10] = "../storage_server/TPCC_orderindex";
+    }
+}
+
+Page* ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id){    
+    storage_service::StorageService_Stub storage_stub(get_storage_channel());
+    storage_service::GetPageRequest request;
+    storage_service::GetPageResponse response;
+    auto page_id_pb = request.add_page_id();
+    page_id_pb->set_page_no(page_id);
+    page_id_pb->set_table_name(table_name_meta[table_id]);
+    brpc::Controller cntl;
+    storage_stub.GetPage(&cntl, &request, &response, NULL);
+    if(cntl.Failed()){
+        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
+    }
+    assert(response.data().size() == PAGE_SIZE);
+    return node_->getBufferPoolByIndex(table_id)->GetPage(page_id);
 }
 
 void ComputeServer::FlushRPCDone(bufferpool_service::FlushPageResponse* response, brpc::Controller* cntl) {

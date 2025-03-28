@@ -123,9 +123,9 @@ public:
 struct dtx_entry {
   dtx_entry(uint64_t seed, int type, tx_id_t tid, bool is_par):seed(seed),type(type),tid(tid),is_partitioned(is_par) {}
   uint64_t seed;
-  bool is_partitioned;
   int type;
   tx_id_t tid;
+  bool is_partitioned;
 };
 
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
@@ -134,6 +134,7 @@ struct dtx_entry {
 class ComputeServer {
 public:
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
+        InitTableNameMeta();
         // 构造与其他计算节点通信的channel
         nodes_channel = new brpc::Channel[ComputeNodeCount];
         brpc::ChannelOptions options;
@@ -265,7 +266,7 @@ public:
     void phase_switch_run_thread(int try_operation_cnt, int thread_id); //每个线程的运行函数
     
     void rpc_phase_switch_get_invalid_pages_new();
-
+    void rpc_phase_switch_sync_invalid_pages_new(); //强同步所有节点的无效页
     void rpc_phase_switch_invalid_pages(int start_pageid, int end_pageid); //将范围内符合条件的数据页设置为无效
     void rpc_phase_switch_invalid_pages_new(); //将范围内符合条件的数据页设置为无效
 
@@ -349,6 +350,33 @@ public:
     void rpc_delay_fetch_release_all_page_async_new();
     // ****************** delay fetch end *********************
 
+    // ****************** for single *********************
+    Page* single_fetch_s_page(table_id_t table_id, page_id_t page_id);
+    Page* single_fetch_x_page(table_id_t table_id, page_id_t page_id);
+    void single_release_s_page(table_id_t table_id, page_id_t page_id);
+    void single_release_x_page(table_id_t table_id, page_id_t page_id);
+    // ****************** for single end *********************
+
+    // ****************** for leap *************************
+    Page* rpc_leap_fetch_all_page(std::vector<table_id_t> table_ids, std::vector<page_id_t> page_ids, std::vector<bool> is_x);
+    Page* rpc_leap_fetch_s_page(table_id_t table_id, page_id_t page_id);
+    Page* rpc_leap_fetch_x_page(table_id_t table_id, page_id_t page_id);
+    void rpc_leap_release_s_page(table_id_t table_id, page_id_t page_id);
+    void rpc_leap_release_x_page(table_id_t table_id, page_id_t page_id);
+    // ****************** for leap end *********************
+
+    // ****************** for star *************************
+    Page* rpc_star_fetch_s_page(table_id_t table_id, page_id_t page_id);
+    Page* rpc_star_fetch_x_page(table_id_t table_id, page_id_t page_id);
+    void rpc_star_release_s_page(table_id_t table_id, page_id_t page_id);
+    void rpc_star_release_x_page(table_id_t table_id, page_id_t page_id);
+    bool fetch_page_from_storage(table_id_t table_id, page_id_t page_id);
+    // ****************** for star end *********************
+
+    std::vector<std::string> table_name_meta;
+    void InitTableNameMeta();
+    Page* rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id);
+
     inline bool is_partitioned_page(page_id_t page_id){
         return page_id >= node_->getNodeID() * PartitionDataSize && page_id < (node_->getNodeID() + 1) * PartitionDataSize;
     }
@@ -371,7 +399,8 @@ public:
     inline node_id_t get_node_id_by_page_id_new(table_id_t table_id, page_id_t page_id){
         auto max_pages_this_table = node_->meta_manager_->GetMaxPageNumPerTable(table_id);
         auto partition_size = max_pages_this_table / ComputeNodeCount;
-        return (page_id - 1)/ partition_size;
+        int node_id = (page_id - 1) / partition_size;
+        return node_id >= ComputeNodeCount ? ComputeNodeCount - 1 : node_id;
     }
 
     // 生成一个随机的数据页ID
